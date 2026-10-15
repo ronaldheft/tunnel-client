@@ -6,6 +6,15 @@ what the runtime has observed. Reading health never initializes MCP, lists
 tools, starts another child, or probes a dependency. Observations are historical
 evidence at their timestamps, not a continuous reachability guarantee.
 
+When startup listener waiting is enabled, transient listener failures continue
+recovering after the initial wait expires. Readiness retains the failed startup
+observation until a subsequent probe succeeds or reaches an authentication-required
+listener. OAuth discovery likewise stays pending during transient resource or
+issuer metadata failures and completes after recovery. These retries stop at
+successful startup; health snapshots remain historical observations, not ongoing
+uptime monitoring. See [startup listener wait](configuration.md)
+for the configuration and retry policy.
+
 ## Routes and compatibility
 
 | Request | Response |

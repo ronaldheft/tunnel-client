@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// ProbeState tracks the result of the one-time startup probe against the main MCP channel.
+// ProbeState tracks the startup probe and any subsequent transient-failure recovery.
 type ProbeState struct {
 	done      chan struct{}
 	mu        sync.Mutex
@@ -200,4 +200,13 @@ func NewStartupWaitTimeoutError(timeout time.Duration, cause error) error {
 func IsStartupWaitTimeoutError(err error) bool {
 	var timeoutErr *StartupWaitTimeoutError
 	return errors.As(err, &timeoutErr)
+}
+
+// replaceResult updates a completed startup observation after a recovery probe.
+// Existing waiters remain unblocked; readiness reads the latest observation.
+func (p *ProbeState) replaceResult(err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.checkedAt = time.Now().UTC()
+	p.err = err
 }

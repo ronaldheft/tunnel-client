@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -992,4 +993,91 @@ func mustParseURL(t *testing.T, raw string) *url.URL {
 		t.Fatalf("parse URL %q: %v", raw, err)
 	}
 	return parsed
+}
+
+func TestStartupProbeRecoversAfterWaitExpires(t *testing.T) {
+	t.Parallel()
+	state := NewProbeState()
+	blocked := make(chan struct{})
+	recovered := make(chan struct{})
+	done := make(chan struct{})
+	waits := 0
+	attempts := 0
+	go func() {
+		defer close(done)
+		runStartupProbeWithRecovery(context.Background(), startupProbeRetryOptions{
+			waitTimeout: time.Second, probeTimeout: time.Second,
+			wait: func(ctx context.Context, _ time.Duration) error {
+				waits++
+				if waits == 1 {
+					return context.DeadlineExceeded
+				}
+				close(blocked)
+				select {
+				case <-recovered:
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			},
+		}, func(context.Context) (probeSession, error) {
+			attempts++
+			if attempts == 1 {
+				return nil, syscall.ECONNREFUSED
+			}
+			return nil, NewProbeHTTPStatusError(http.StatusUnauthorized, errors.New("authentication required"))
+		}, slog.New(slog.NewTextHandler(io.Discard, nil)), state)
+	}()
+	select {
+	case <-blocked:
+	case <-time.After(time.Second):
+		t.Fatal("no background recovery after startup wait")
+	}
+	if _, err, ok := state.Wait(time.Second); !ok || !IsStartupWaitTimeoutError(err) {
+		t.Fatalf("lost failed startup readiness: %v", err)
+	}
+	close(recovered)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("recovery did not finish")
+	}
+	if _, err, ok := state.Wait(time.Second); !ok || !IsAuthRequiredProbeError(err) {
+		t.Fatalf("listener did not recover: %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("want two probes, got %d", attempts)
+	}
+}
+
+func TestStartupRecoveryStopsOnCancellation(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	state := NewProbeState()
+	attempts := 0
+	runStartupProbeWithRecovery(ctx, startupProbeRetryOptions{
+		waitTimeout: time.Second,
+		wait:        func(context.Context, time.Duration) error { cancel(); return context.Canceled },
+	}, func(context.Context) (probeSession, error) {
+		attempts++
+		return nil, NewProbeHTTPStatusError(http.StatusServiceUnavailable, errors.New("warming up"))
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)), state)
+	if attempts != 1 {
+		t.Fatalf("cancellation started another probe: %d", attempts)
+	}
+}
+
+func TestStartupRecoveryKeepsPermanentFailures(t *testing.T) {
+	t.Parallel()
+	state := NewProbeState()
+	runStartupProbeWithRecovery(t.Context(), startupProbeRetryOptions{
+		waitTimeout: time.Second,
+		wait:        func(context.Context, time.Duration) error { t.Fatal("permanent error retried"); return nil },
+	}, func(context.Context) (probeSession, error) {
+		return nil, NewProbeHTTPStatusError(http.StatusForbidden, errors.New("forbidden"))
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)), state)
+	_, err, ok := state.Wait(time.Second)
+	if !ok || err == nil {
+		t.Fatal("permanent startup failure was cleared")
+	}
 }

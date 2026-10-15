@@ -610,8 +610,21 @@ routing, streaming, OAuth discovery, and common setup pitfalls, see
     any HTTP response, including `401 Unauthorized`, proves the listener is
     reachable.
   - If the wait expires, polling resumes for compatibility while `/readyz`
-    remains non-ready for the startup failure. This setting does not retry or
-    replay tunneled MCP commands.
+    remains non-ready for the startup failure. The client continues initialization
+    probes in the background for transient connection failures, timeouts, and
+    HTTP 408/429/500/502/503/504 responses. Backoff grows to 30 seconds; a recovered
+    listener (including an authentication-required 401) updates startup readiness
+    without restarting the process. Permanent failures still stop recovery.
+    Shutdown cancels the probes. This never retries or replays tunneled commands.
+  - HTTP OAuth discovery independently retries transient network failures and
+    HTTP 408/429/500/502/503/504, including failures of the advertised issuer's
+    metadata endpoint. The complete sequence uses a fresh timeout per attempt,
+    jittered backoff capped at 30 seconds, and honors `Retry-After` up to 10 minutes.
+    A missing optional discovery path (404) does not suppress retries of another
+    temporarily unavailable candidate. All-404 plain MCP discovery and permanent
+    trust/configuration failures keep their existing behavior. Discovery remains
+    pending until recovery; no partial OAuth target catalog is published while
+    issuer metadata is temporarily unavailable.
 - **Max concurrent requests**
   - Flag: `--mcp.max-concurrent-requests`
   - Env: `MCP_MAX_CONCURRENT_REQUESTS`

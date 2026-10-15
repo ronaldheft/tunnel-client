@@ -189,7 +189,7 @@ func probeMcpServer(p runnerParams) error {
 					})
 				}
 				if p.Config.StartupWaitTimeout > 0 {
-					runStartupProbeWithRetry(
+					runStartupProbeWithRecovery(
 						ctx,
 						startupProbeRetryOptions{
 							waitTimeout:           p.Config.StartupWaitTimeout,
@@ -664,4 +664,63 @@ func transportTargetLabel(kind runtimeconfig.MCPTransportKind, serverURL *url.UR
 		return string(runtimeconfig.MCPTransportHTTPStreamable)
 	}
 	return string(kind)
+}
+
+// runStartupProbeWithRecovery preserves the bounded startup gate, then keeps
+// retrying transient failures in the background. Polling may resume after the
+// gate expires, but a failed probe remains non-ready until a new probe settles.
+// Only initialization probes are repeated; tunneled commands are never replayed.
+func runStartupProbeWithRecovery(ctx context.Context, options startupProbeRetryOptions,
+	connect func(context.Context) (probeSession, error), logger *slog.Logger, state *ProbeState,
+) {
+	runStartupProbeWithRetry(ctx, options, connect, logger, state)
+	_, err, done := state.Wait(0)
+	if options.waitTimeout <= 0 || !done || !isRecoverableStartupProbeError(err, options.retryUnixSocketENOENT) {
+		return
+	}
+	wait := options.wait
+	if wait == nil {
+		wait = waitForStartupProbeRetry
+	}
+	delay := time.Second
+	probeTimeout := options.probeTimeout
+	if probeTimeout <= 0 {
+		probeTimeout = defaultProbeTimeout
+	}
+	for {
+		if wait(ctx, delay) != nil {
+			return
+		}
+		result, settled := runStartupProbeAttempt(ctx, probeTimeout, connect)
+		if !settled {
+			return
+		}
+		if isRecoverableStartupProbeError(result.err, options.retryUnixSocketENOENT) {
+			if logger != nil {
+				logger.WarnContext(ctx, "MCP startup recovery pending", slog.String("error", tclog.ErrorForLog(result.err)))
+			}
+			delay = nextStartupProbeBackoff(delay, 30*time.Second)
+			continue
+		}
+		recovered := NewProbeState()
+		recordStartupProbeResult(ctx, logger, recovered, result)
+		_, err, _ := recovered.Wait(0)
+		state.replaceResult(err)
+		return
+	}
+}
+
+func isRecoverableStartupProbeError(err error, unixSocket bool) bool {
+	if IsStartupWaitTimeoutError(err) || IsTimeoutProbeError(err) || isRetryableStartupProbeError(err, unixSocket) {
+		return true
+	}
+	var status *ProbeHTTPStatusError
+	if errors.As(err, &status) {
+		switch status.StatusCode {
+		case http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusInternalServerError,
+			http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+			return true
+		}
+	}
+	return false
 }

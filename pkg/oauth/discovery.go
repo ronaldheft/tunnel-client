@@ -107,6 +107,7 @@ func runOAuthMetadataDiscoveryPass(
 		attempts[i].Selected = false
 		attempts[i].StatusCode = 0
 		attempts[i].Error = ""
+		attempts[i].retry = startupRetry{}
 
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, candidate.URL.String(), nil)
 		if err != nil {
@@ -135,6 +136,7 @@ func runOAuthMetadataDiscoveryPass(
 				err,
 			)
 			attempts[i].Error = lastErr.Error()
+			attempts[i].retry = startupRetryForError(err)
 			if classifyDiscoveryFailure(err) == discoveryFailureTypeNonTimeout {
 				failureType = discoveryFailureTypeNonTimeout
 			}
@@ -145,11 +147,14 @@ func runOAuthMetadataDiscoveryPass(
 		}
 
 		attempts[i].StatusCode = resp.StatusCode
+		advice := startupRetryForStatus(resp.StatusCode, resp.Header)
+		attempts[i].retry = advice
 		body, readErr := io.ReadAll(io.LimitReader(resp.Body, protectedResourceMetadataBodyLimitBytes+1))
 		_ = resp.Body.Close()
 		if readErr != nil {
 			lastErr = fmt.Errorf("oauth discovery read %s: %w", urlForLog, readErr)
 			attempts[i].Error = lastErr.Error()
+			attempts[i].retry = startupRetryForError(readErr)
 			if classifyDiscoveryFailure(readErr) == discoveryFailureTypeNonTimeout {
 				failureType = discoveryFailureTypeNonTimeout
 			}

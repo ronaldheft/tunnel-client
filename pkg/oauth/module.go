@@ -207,7 +207,7 @@ func startOAuthDiscoveryWithRetryPolicy(p discoveryParams, retryPolicy oauthDisc
 
 				retryBackoff := retryPolicy.backoff()
 				// Retry the full discovery sequence with a fresh timeout so a
-				// transient startup timeout can observe recovered probe and metadata
+				// transient startup failure can observe recovered probe and metadata
 				// endpoints without terminally settling readiness.
 				for {
 					fetchCtx, fetchCancel := context.WithTimeout(ctx, DefaultDiscoveryTimeout)
@@ -236,14 +236,20 @@ func startOAuthDiscoveryWithRetryPolicy(p discoveryParams, retryPolicy oauthDisc
 
 					resp, sourceURL, attempts, err := FetchOAuthMetadata(fetchCtx, p.HTTPClient, candidates, logger)
 					result := BuildDiscoveryResult(resp, sourceURL, start, attempts)
+					// The shared fetcher forwards valid metadata with its original
+					// status for polled requests. Startup must not accept a 429/5xx
+					// response as a completed discovery, even if its JSON is valid.
+					if resp != nil && startupRetryForStatus(resp.ResponseCode(), nil).transient {
+						err = fmt.Errorf("oauth discovery status %d", resp.ResponseCode())
+					}
 					if err != nil {
 						if errors.Is(err, context.Canceled) && ctx.Err() != nil {
 							fetchCancel()
 							return
 						}
-						if classifyDiscoveryFailure(err) == discoveryFailureTypeTimeoutOnly {
-							retryIn := retryBackoff.Duration()
-							logger.WarnContext(fetchCtx, "OAuth discovery timed out; retrying",
+						if advice := protectedResourceStartupRetry(attempts); advice.transient {
+							retryIn := max(retryBackoff.Duration(), advice.after)
+							logger.WarnContext(fetchCtx, "OAuth discovery temporarily unavailable; retrying",
 								slog.String("error", err.Error()),
 								slog.Duration("retry_in", retryIn),
 							)
@@ -292,6 +298,19 @@ func startOAuthDiscoveryWithRetryPolicy(p discoveryParams, retryPolicy oauthDisc
 						},
 						logger,
 					)
+					if authServerMetaFetch != nil && authServerMetaFetch.retry.transient {
+						// Do not settle discovery or publish a partial catalog
+						// while the advertised issuer is temporarily unavailable.
+						retryIn := max(retryBackoff.Duration(), authServerMetaFetch.retry.after)
+						logger.WarnContext(fetchCtx, "OAuth issuer discovery temporarily unavailable; retrying",
+							slog.String("error", authServerMetaFetch.failure.Error()),
+							slog.Duration("retry_in", retryIn))
+						fetchCancel()
+						if !retryPolicy.waitForRetry(ctx, retryIn) {
+							return
+						}
+						continue
+					}
 					if result != nil && authServerMetaFetch != nil {
 						result.AuthServerMetadata = authServerMetaFetch
 					}

@@ -43,6 +43,7 @@ const (
 )
 
 type AuthServerMetadataAttempt struct {
+	retry             startupRetry
 	URL               string                      `json:"url,omitempty"`
 	Document          AuthServerMetadataDocument  `json:"document,omitempty"`
 	PathStyle         AuthServerMetadataPathStyle `json:"path_style,omitempty"`
@@ -60,6 +61,8 @@ type AuthServerMetadataAttempt struct {
 }
 
 type AuthServerMetadataFetchResult struct {
+	retry       startupRetry
+	failure     error
 	IssuerURL   string                      `json:"issuer_url,omitempty"`
 	SelectedURL string                      `json:"selected_url,omitempty"`
 	Attempts    []AuthServerMetadataAttempt `json:"attempts,omitempty"`
@@ -137,11 +140,17 @@ func FetchAuthServerMetadataWithResult(
 		}
 	}
 
-	return nil, result, fmt.Errorf(
+	result.failure = fmt.Errorf(
 		"oauth auth-server metadata fetch failed for issuer %q: %w",
 		tclog.RedactURLString(issuerURL),
 		errors.Join(errs...),
 	)
+	advice := make([]startupRetry, 0, len(result.Attempts))
+	for _, attempt := range result.Attempts {
+		advice = append(advice, attempt.retry)
+	}
+	result.retry = combineStartupRetries(advice)
+	return nil, result, result.failure
 }
 
 func runFetchAuthServerMetadataPass(
@@ -175,6 +184,10 @@ func runFetchAuthServerMetadataPass(
 		}
 		if err != nil {
 			attempt.Error = tclog.ErrorForLog(err)
+			attempt.retry = startupRetryForError(err)
+			if response != nil && response.StatusCode != http.StatusOK {
+				attempt.retry = startupRetryForStatus(response.StatusCode, response.Headers)
+			}
 			result.Attempts = append(result.Attempts, attempt)
 			errs = append(errs, wrapErrorWithRedactedMessage(
 				fmt.Sprintf("%s: %s", tclog.RedactURLString(candidate.URL), tclog.ErrorForLog(err)),

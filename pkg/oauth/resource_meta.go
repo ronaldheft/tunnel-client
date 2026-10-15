@@ -40,6 +40,7 @@ type DiscoveryCandidate struct {
 
 // DiscoveryAttempt captures one discovery attempt for UI/reporting.
 type DiscoveryAttempt struct {
+	retry      startupRetry
 	URL        string          `json:"url"`
 	Source     DiscoverySource `json:"source"`
 	Tried      bool            `json:"tried,omitempty"`
